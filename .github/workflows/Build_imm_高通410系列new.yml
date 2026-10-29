@@ -1,7 +1,7 @@
 #
 #
 
-name: 🚀 Build_imm_高通410系列
+name: 🚀 Build_imm_高通410系列-new
 
 on:
   repository_dispatch:
