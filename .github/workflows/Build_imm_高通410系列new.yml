@@ -79,7 +79,7 @@ jobs:
         ./scripts/show_hardware_info.sh
   
     - name: Free Disk Space (Ubuntu)
-      uses: jlumbroso/free-disk-space@main
+      uses: jlumbroso/free-disk-space@v1.3.0
       with:
         tool-cache: false
         android: false
@@ -156,6 +156,15 @@ jobs:
         ln -sf /mnt/openwrt $GITHUB_WORKSPACE/openwrt
 
 
+
+    - name: Clean build environment
+      run: |
+        cd openwrt
+        echo "🧹 Cleaning old build artifacts..."
+        make clean >/dev/null 2>&1 || true
+        rm -rf build_dir target/ staging_dir/ dl/
+        df -hT
+
     - name:  files
       run: cp -r files openwrt/files
 
@@ -166,13 +175,6 @@ jobs:
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P1_SH
         
-
-    - name: Clean build environment
-      working-directory: openwrt
-      run: |
-        echo "🧹 Cleaning build environment..."
-        make clean
-        rm -rf build_dir staging_dir target/ dl/
 
     - name: Update feeds
       run: cd openwrt && ./scripts/feeds update -a
@@ -185,20 +187,6 @@ jobs:
     - name: Install feeds
       run: cd openwrt && ./scripts/feeds install -a -f
 
-    - name: Verify libffi dependency
-      run: |
-        echo "🔍 Verifying critical dependencies..."
-        if [ -d "./openwrt/feeds/packages/libs/libffi" ]; then
-          echo "✅ libffi dependency found successfully!"
-        elif [ -d "./openwrt/feeds/packages/net/libffi" ]; then
-          echo "✅ libffi dependency found (net/libffi)!"
-        else
-          echo "⚠️ Warning: libffi package not found in expected location"
-          echo "Searching for libffi..."
-          find ./openwrt/feeds -name "libffi" -type d 2>/dev/null || echo "libffi not found in feeds"
-          echo "Continuing anyway - may fail during compilation if libffi is required"
-        fi
-
     - name: Load custom configuration
       run: |
         [ -e files ] && mv files openwrt/files
@@ -206,6 +194,22 @@ jobs:
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
+
+
+    - name: Verify configuration file
+      run: |
+        cd openwrt
+        if [ -f .config ]; then
+          echo "✅ .config file found"
+          echo "--- Target config ---"
+          grep -E 'CONFIG_TARGET.*DEVICE|CONFIG_TARGET_.*=y' .config | head -10
+          echo "---"
+        else
+          echo "❌ ERROR: .config file not found in openwrt/!"
+          echo "Please ensure config/{profile}.config exists in your repository"
+          ls -la ../config/ 2>/dev/null || echo "config/ directory not found in repo root"
+          exit 1
+        fi
 
     - name: Install extra packages
       if: ${{ inputs.extra_packages != '' }}
@@ -262,13 +266,39 @@ jobs:
         
     - name: SSH 调试有效时间6h! 连接后输入q 输入exit即可退出，自动继续后续编译流程
       uses: mxschmitt/action-tmate@v3
-      if: ${{ inputs.ssh == true }}
+      if: ${{ inputs.ssh || contains(github.event.action, 'ssh') }}
       
       
+
+    - name: Verify libffi dependency
+      run: |
+        cd openwrt
+        echo "🔍 Checking libffi dependency..."
+        if find . -path "*/libffi/Makefile" -type f | grep -q .; then
+          echo "✅ libffi found in feeds"
+          find . -path "*/libffi/Makefile" -type f
+        else
+          echo "⚠️  libffi Makefile not found in feeds (may still work if glib2 is not selected)"
+          # 检查 glib2 是否在配置中启用
+          if grep -q "^CONFIG_PACKAGE_glib2=y" .config 2>/dev/null; then
+            echo "❌ ERROR: CONFIG_PACKAGE_glib2=y is set but libffi is missing!"
+            exit 1
+          else
+            echo "ℹ️  glib2 not enabled in config, skipping libffi check"
+          fi
+        fi
+
     - name: Config defconfig
       id: config
       run: |
        cd openwrt
+       # 确保 .config 存在（防止上一步失败导致后续报错）
+       if [ ! -f .config ]; then
+         echo "❌ FATAL: .config not found! Cannot proceed without configuration."
+         ls -la .config* 2>/dev/null || echo "No .config files found"
+         exit 1
+       fi
+       echo "🛠️  Running defconfig..."
        make defconfig
        
     - name: Download package
