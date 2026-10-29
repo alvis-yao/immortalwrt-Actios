@@ -89,7 +89,8 @@ jobs:
         # ★ 这些默认是 true，之前全被设成 false，等于没清。
         #   tool-cache ≈5GB、large-packages ≈6GB、docker-images ≈10GB，加起来 20GB+
         #   OpenWrt 是交叉编译，不需要 host docker / dotnet / android，放心清
-        tool-cache: true
+        #   tool-cache 这个入参已改名 preinstalled-runtimes（旧名还能用，但会报警告）
+        preinstalled-runtimes: true
         android: true
         dotnet: true
         haskell: true
@@ -344,6 +345,19 @@ jobs:
       uses: mxschmitt/action-tmate@master
       if: ${{ inputs.ssh || contains(github.event.action, 'ssh') }}
 
+    - name: Verify root /var patch
+      run: |
+        cd openwrt
+        # 补丁本体在 diy-part2.sh 里（改 include/package-pack.mk），这里只做校验，
+        # 缺了就立刻失败，别等到编译几十分钟后在 base-files 装 root 时炸。
+        if grep -qs "ROOT_VAR_FIX" include/package-pack.mk include/package-ipkg.mk; then
+          echo "✅ /var 软链冲突补丁已就位："
+          grep -n -A5 "ROOT_VAR_FIX" include/package-pack.mk include/package-ipkg.mk
+        else
+          echo "::error::构建系统里没有 ROOT_VAR_FIX 补丁（diy-part2.sh 未生效或上游改了结构）。缺了它，base-files 把 /var 换成软链时会撞上 dbus 已建的真目录，报 cp: cannot overwrite directory .../var"
+          exit 1
+        fi
+
     - name: Config defconfig
       id: config
       run: |
@@ -432,23 +446,8 @@ jobs:
         cd openwrt
         echo "$(nproc) thread compile"
 
-        # ★ base-files 必须先单独装进 root-msm89xx
-        # base-files 的 install 会往 root 里放 /var -> tmp 的符号链接；
-        # 而 dbus（被 modemmanager 依赖，modemmanager 又由 luci-app-droidmodem 带进来）
-        # 的 .pkgdir 里带真实目录 var/lib/dbus。并行 -jN 时 dbus 抢先装，
-        # root 里的 /var 变成真目录，base-files 再放符号链接就直接报：
-        #   cp: cannot overwrite directory '.../root-msm89xx/./var' with non-directory
-        #   make[3]: *** [.../stamp/.base-files_installed] Error 1
-        # 先把 base-files 装好，后面所有包都会顺着 /var -> tmp 写，不会再撞。
-        if ! make -j$(nproc) V=s package/base-files/compile > base-files.log 2>&1; then
-          echo "::error::base-files 预装失败（toolchain + base-files）"
-          grep -nE "^ERROR:|error:|Error [0-9]+$" base-files.log | tail -20 || true
-          tail -60 base-files.log
-          exit 1
-        fi
-        echo "✅ base-files 已预装："
-        ls -ld staging_dir/target-*/root-*/var 2>/dev/null || true
-
+        # /var 软链冲突已在 diy-part2.sh 里从根上修掉（include/package-pack.mk 打了补丁），
+        # 这里恢复成一次完整编译，不再拆出 base-files 预装。
         if ! make -j$(nproc) V=s > build.log 2>&1; then
           echo "::error::编译失败。并行编译时错误在日志中间，tail 只能看到最后收尾的包，下面按优先级抓真因"
           echo
@@ -481,6 +480,29 @@ jobs:
             echo "日志里没有 make Error 行，可能是超时 / 被 runner 回收，看 build.log 最后 50 行"
             tail -50 build.log || true
           fi
+          # 同时把关键结论写进运行页的 Summary，手机 / 截图都能直接看，不用下 artifact
+          {
+            echo "## ❌ 编译失败：先看这里"
+            echo '```text'
+            echo "--- 磁盘 ---"
+            df -h /mnt 2>/dev/null | tail -1 || true
+            echo "--- 失败包（^ERROR:）---"
+            grep -E "^ERROR: .*failed to build" build.log | head -10 || true
+            echo "--- 最早 3 处 make Error ---"
+            grep -nE "^make\[[0-9]+\]: \*\*\* .*Error [0-9]+$" build.log | head -3 || true
+            echo "--- 资源类 ---"
+            grep -E "No space left on device|Cannot allocate memory|virtual memory exhausted|Killed process|oom-kill|Error 137" build.log | tail -5 || true
+            echo "--- 失败点前 25 行 ---"
+            F2=$(grep -nE "^make\[[0-9]+\]: \*\*\* .*Error [0-9]+$" build.log | head -1 | cut -d: -f1)
+            if [ -n "$F2" ]; then
+              S2=$((F2-25)); if [ "$S2" -lt 1 ]; then S2=1; fi
+              sed -n "${S2},${F2}p" build.log | cut -c1-300
+            else
+              tail -25 build.log | cut -c1-300 || true
+            fi
+            echo '```'
+            echo "完整日志见 artifact **build-log**（openwrt/build.log）"
+          } >> "$GITHUB_STEP_SUMMARY"
           exit 1
         fi
         echo "status=success" >> $GITHUB_OUTPUT
@@ -493,7 +515,9 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: build-log
-        path: openwrt/build.log
+        path: |
+          openwrt/build.log
+          openwrt/*.log
         if-no-files-found: ignore
 
     - name: Get kernel version
