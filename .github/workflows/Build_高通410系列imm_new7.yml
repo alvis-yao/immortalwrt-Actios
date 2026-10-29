@@ -1,0 +1,661 @@
+#
+#
+
+name: 🚀 Build_高通410系列imm_new7
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: ' ← 选择是否开启 SSH 调试专业人员使用'
+        required: false
+        default: false
+        type: boolean
+      profile:
+        description: ' ↓ 支持多款型号 手动选择要编译的机型 ↓ '
+        type: choice
+        options:
+          - ufi103s
+          - ufi003
+          - ufi001c
+          - ufi001b
+          - jz02v10
+          - qrzl903
+          - w001
+          - uz801
+          - mf32
+          - mf601
+          - wf2
+          - sp970v11
+          - sp970v10
+        default: ufi103s
+        required: true
+      upstream:
+        description: ' ↓ 选择上游源码仓库 ↓ '
+        type: choice
+        options:
+          - lkiuyu/immortalwrt
+        default: lkiuyu/immortalwrt
+        required: true
+      custom_hash:
+        description: ' ↓ 指定 hash（默认不用填写）↓ '
+        required: false
+        default: ''
+        type: string
+      extra_packages:
+        description: ' ↓ 输入额外包名（逗号或空格分隔，留空则不添加任何额外包）↓ '
+        required: false
+        default: ''
+        type: string
+
+env:
+  # 统一默认值：repository_dispatch 触发时 inputs 全为空，原来会 clone 一个空地址
+  REPO_URL: https://github.com/${{ github.event.inputs.upstream || 'lkiuyu/immortalwrt' }}
+  REPO_BRANCH: master
+  # 默认机型 ufi103s：repository_dispatch 触发时 inputs 为空，靠这里的兜底决定编哪个
+  PROFILE: ${{ github.event.inputs.profile || 'ufi103s' }}
+  EXTRA_PACKAGES: ${{ github.event.inputs.extra_packages }}
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: config/${{ github.event.inputs.profile || 'ufi103s' }}.config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+  # ⬇⬇⬇ 要改管理 IP / 主机名，就改下面这两行 ⬇⬇⬇
+  DEFAULT_LAN_IP: 192.168.20.1
+  DEFAULT_HOSTNAME: AlvisWrt
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Show hardware info
+      run: |
+        chmod 755 ./scripts/show_hardware_info.sh
+        ./scripts/show_hardware_info.sh
+
+    - name: Free Disk Space (Ubuntu)
+      uses: jlumbroso/free-disk-space@main
+      with:
+        # ★ 这些默认是 true，之前全被设成 false，等于没清。
+        #   tool-cache ≈5GB、large-packages ≈6GB、docker-images ≈10GB，加起来 20GB+
+        #   OpenWrt 是交叉编译，不需要 host docker / dotnet / android，放心清
+        tool-cache: true
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: true
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -y update
+        DEPS=$(curl -fsSL https://raw.githubusercontent.com/xuxin1955/depend_ubuntu2204_openwrt/refs/heads/main/depend_ubuntu2204_openwrt || true)
+        if [ -z "$DEPS" ]; then
+          echo "::error::依赖列表拉取失败，检查网络"
+          exit 1
+        fi
+        sudo -E apt-get -y install $DEPS
+        sudo timedatectl set-timezone "$TZ"
+        sudo chmod 777 /mnt
+        df -hT
+
+    - name: mkbootimg build
+      run: |
+        wget https://github.com/xuxin1955/depend_ubuntu2204_openwrt/releases/download/ubuntu_26.04_LTS_mkbootimg/mkbootimg_34.0.5-12build1_all.deb
+        sudo dpkg -i mkbootimg_34.0.5-12build1_all.deb
+        sudo apt-get install -f -y
+        mkbootimg --help || true
+        MKBOOTIMG_PATH=$(which mkbootimg)
+        if [ -n "$MKBOOTIMG_PATH" ]; then
+          echo "mkbootimg found at: $MKBOOTIMG_PATH"
+          file "$MKBOOTIMG_PATH"
+        else
+          echo "❌ mkbootimg not found in PATH!"
+        fi
+
+    - name: Ensure Python build tools
+      run: |
+        python3 -m pip cache purge
+        python3 -m pip install --upgrade --force-reinstall pip
+        python3 -m pip install --upgrade --force-reinstall 'setuptools>=65' wheel
+        python3 -m pip install --upgrade 'setuptools-scm>=8,<10'
+        python3 -m pip install --upgrade cython packaging tomli
+        python3 -m pip install Unidecode pyelftools
+        python3 -m pip --version
+        python3 -c "import setuptools.build_meta; print('setuptools.build_meta OK')"
+
+    - name: 读取锁定的上游 hash (Read locked upstream hash)
+      id: lock
+      run: |
+        CUSTOM_HASH="${{ github.event.inputs.custom_hash }}"
+        LOCK_FILE="upstream_lock.txt"
+        if [ -n "$CUSTOM_HASH" ]; then
+          echo "locked_hash=$CUSTOM_HASH" >> $GITHUB_OUTPUT
+          echo "使用用户指定 hash: $CUSTOM_HASH"
+        elif [ -f "$LOCK_FILE" ]; then
+          HASH=$(cat $LOCK_FILE)
+          echo "locked_hash=$HASH" >> $GITHUB_OUTPUT
+          echo "使用锁定 hash: $HASH"
+        else
+          echo "locked_hash=" >> $GITHUB_OUTPUT
+          echo "upstream_lock.txt 不存在，使用最新 master"
+        fi
+
+    - name: Clone source code
+      working-directory: /mnt
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        if [ -n "${{ steps.lock.outputs.locked_hash }}" ]; then
+          cd openwrt && git checkout ${{ steps.lock.outputs.locked_hash }}
+        fi
+        ln -sf /mnt/openwrt $GITHUB_WORKSPACE/openwrt
+
+    # ==========================================================
+    # 关键修复：lkiuyu/immortalwrt 的 package/libs 下没有 libffi，
+    # 而 feeds/packages/glib2 的 glib2-gobject / glib2-gio 硬依赖 +libffi
+    # （host 构建还要 libffi/host）。缺包会导致：
+    #   WARNING: ... has a dependency on 'libffi', which does not exist
+    #   Package glib2-gobject is missing dependencies for: libffi.so.8
+    # 该包在官方 immortalwrt 里只有一个 Makefile（3.4.x），直接取回即可。
+    # ==========================================================
+    - name: Patch upstream (补回 libffi)
+      run: |
+        cd openwrt
+        if [ -f package/libs/libffi/Makefile ]; then
+          echo "✅ 上游已自带 libffi，跳过"
+        else
+          mkdir -p package/libs/libffi
+          if curl -fsSL --retry 3 --retry-delay 2 \
+              https://raw.githubusercontent.com/immortalwrt/immortalwrt/master/package/libs/libffi/Makefile \
+              -o package/libs/libffi/Makefile \
+             && grep -q '^PKG_NAME:=libffi' package/libs/libffi/Makefile; then
+            echo "✅ 已补回 libffi：$(grep '^PKG_VERSION' package/libs/libffi/Makefile)"
+          else
+            rm -f package/libs/libffi/Makefile
+            echo "::error::libffi 补丁失败，glib2 打包必然再次报 libffi.so.8 缺失"
+            exit 1
+          fi
+        fi
+
+    - name: Load custom files
+      run: |
+        if [ -d files ]; then
+          mkdir -p openwrt/files
+          cp -r files/. openwrt/files/
+          echo "✅ 已注入 files/"
+        else
+          echo "无 files 目录，跳过"
+        fi
+
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Remove conflicting packages from smpackage
+      run: |
+        # 删除 small-package 中与系统冲突的包，避免编译报错（官方推荐操作）
+        rm -rf openwrt/feeds/smpackage/{base-files,dnsmasq,firewall*,fullconenat,libnftnl,nftables,ppp,opkg,ucl,upx,vsftpd*,miniupnpd-iptables,wireless-regdb}
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a -f
+
+    # 注意：这里不要再 mv files，files 已在上面的步骤注入，
+    # 原来的 `mv files openwrt/files` 会产成 openwrt/files/files 套娃。
+    - name: Load custom configuration
+      run: |
+        cd openwrt
+        if [ -f "$GITHUB_WORKSPACE/$CONFIG_FILE" ]; then
+          cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+          echo "✅ 使用配置: $CONFIG_FILE"
+        else
+          echo "::warning::找不到 $CONFIG_FILE，将使用上游默认配置"
+        fi
+        chmod +x $GITHUB_WORKSPACE/$DIY_P2_SH
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    # 管理 IP / 主机名：独立步骤，无条件执行
+    # 之前这两项塞在 Install extra packages 里，靠 __ip__ 前缀触发，
+    # extra_packages 一留空就整段跳过 → 固件永远是 192.168.1.1 / ImmortalWrt
+    - name: Set LAN IP and hostname
+      run: |
+        cd openwrt
+        # 仍支持用 extra_packages 里的 __ip__ / __hostname__ 前缀按次覆盖，默认取 env
+        CUSTOM_IP=$(echo "$EXTRA_PACKAGES" | grep -oP '(?<=__ip__)[^,\s]+' || true)
+        CUSTOM_HOSTNAME=$(echo "$EXTRA_PACKAGES" | grep -oP '(?<=__hostname__)[^,\s]+' || true)
+        LAN_IP=${CUSTOM_IP:-$DEFAULT_LAN_IP}
+        NEW_HOSTNAME=${CUSTOM_HOSTNAME:-$DEFAULT_HOSTNAME}
+        echo "目标：IP=$LAN_IP  主机名=$NEW_HOSTNAME"
+
+        GEN=package/base-files/files/bin/config_generate
+        if [ ! -f "$GEN" ]; then
+          echo "::error::找不到 $GEN，base-files 路径已变"
+          exit 1
+        fi
+
+        # 上游原文：lan) ipad=${ipaddr:-"192.168.1.1"} ;;
+        sed -i "s/192\.168\.1\.1/${LAN_IP}/g" "$GEN"
+        if grep -qF "$LAN_IP" "$GEN"; then
+          echo "✅ 已写入 config_generate: $LAN_IP"
+        else
+          echo "::error::IP 替换失败，config_generate 里没有 192.168.1.1"
+          grep -n 'ipad=${ipaddr' "$GEN" || true
+          exit 1
+        fi
+
+        # 上游原文：set system.@system[-1].hostname='ImmortalWrt'
+        if grep -qF "hostname='ImmortalWrt'" "$GEN"; then
+          sed -i "s/hostname='ImmortalWrt'/hostname='${NEW_HOSTNAME}'/g" "$GEN"
+        fi
+        if grep -qF "hostname='${NEW_HOSTNAME}'" "$GEN"; then
+          echo "✅ 已写入 config_generate: $NEW_HOSTNAME"
+        else
+          echo "::error::主机名替换失败，config_generate 里没有 hostname='ImmortalWrt'"
+          grep -n 'hostname=' "$GEN" | head -5 || true
+          exit 1
+        fi
+
+        # 二级保险：config_generate 只在首启生成 /etc/config/network，
+        # uci-defaults 在其后执行，可再兜一层（防止板级 board.json 带了自己的 IP）
+        mkdir -p files/etc/uci-defaults
+        {
+          echo '#!/bin/sh'
+          echo '[ -f /etc/config/network ] || exit 0'
+          echo "uci -q get network.lan >/dev/null 2>&1 || exit 0"
+          echo "uci -q delete network.lan.ipaddr"
+          echo "uci -q add_list network.lan.ipaddr='${LAN_IP}/24'"
+          echo "uci -q delete network.lan.netmask"
+          echo "uci -q set system.@system[-1].hostname='${NEW_HOSTNAME}'"
+          echo "uci -q commit network"
+          echo "uci -q commit system"
+          echo "/etc/init.d/network reload >/dev/null 2>&1"
+          echo 'exit 0'
+        } > files/etc/uci-defaults/99-set-identity
+        chmod +x files/etc/uci-defaults/99-set-identity
+        echo "✅ 已生成 uci-defaults 兜底脚本"
+        cat files/etc/uci-defaults/99-set-identity
+
+    # 用户输入走 env 传参，避免单引号/反引号注入
+    - name: Install extra packages
+      if: ${{ env.EXTRA_PACKAGES != '' }}
+      run: |
+        cd openwrt
+        RAW="$EXTRA_PACKAGES"
+        echo "=========================================="
+        echo "User requested extra packages:"
+        echo "$RAW"
+        echo "=========================================="
+
+        # IP / 主机名已由上面的 Set LAN IP and hostname 步骤处理，
+        # 这里只保留包名处理，避免两处逻辑互相覆盖
+
+        # 过滤掉特殊前缀，只处理真正的包名
+        PACKAGES=$(echo "$RAW" | sed 's/,/ /g' | tr ' ' '\n' | grep -v '^__ip__' | grep -v '^__hostname__' | tr '\n' ' ')
+
+        # 检测是否选了 turboacc，如果选了则先执行安装脚本
+        if echo "$PACKAGES" | grep -qw "luci-app-turboacc"; then
+          echo "⚡ 检测到 luci-app-turboacc，执行 turboacc 安装脚本..."
+          curl -sSL https://raw.githubusercontent.com/mufeng05/turboacc/main/add_turboacc.sh -o add_turboacc.sh && bash add_turboacc.sh || echo "⚠️ turboacc 脚本执行失败，跳过"
+        fi
+
+        for pkg in $PACKAGES; do
+          if [ -n "$pkg" ]; then
+            # 兼容两种写法：
+            #   纯包名                          → luci-app-ttyd
+            #   直接粘 config 文件里的整行       → CONFIG_PACKAGE_luci-app-passwall2_Basic_Core_Xray=y
+            # 不做这个判断的话，后者会拼成 CONFIG_PACKAGE_CONFIG_PACKAGE_xxx，静默失效
+            case "$pkg" in
+              CONFIG_PACKAGE_*) CFG="${pkg%%=*}" ;;
+              *)                CFG="CONFIG_PACKAGE_${pkg}" ;;
+            esac
+            if grep -q "^# ${CFG} is not set" .config; then
+              sed -i "s/^# ${CFG} is not set$/${CFG}=y/" .config
+              echo "✅ Enabled (replaced): ${CFG}=y"
+            elif grep -q "^${CFG}=" .config; then
+              sed -i "s/^${CFG}=.*$/${CFG}=y/" .config
+              echo "✅ Enabled (updated): ${CFG}=y"
+            else
+              echo "${CFG}=y" >> .config
+              echo "✅ Enabled (appended): ${CFG}=y"
+            fi
+          fi
+        done
+
+    - name: SSH 调试有效时间6h! 连接后输入q 输入exit即可退出，自动继续后续编译流程
+      uses: mxschmitt/action-tmate@master
+      if: ${{ inputs.ssh || contains(github.event.action, 'ssh') }}
+
+    - name: Config defconfig
+      id: config
+      run: |
+        cd openwrt
+        make defconfig
+
+    # 固化在 config/ufi103s.config 里的包，如果 feed 里没有，make defconfig 会静默丢弃，
+    # 编 4 小时后才发现少了东西。这里在 defconfig 之后立刻核对，缺一个就停。
+    - name: Verify requested packages
+      run: |
+        cd openwrt
+        echo "核对固化清单是否真的进了 .config"
+        MISS=""
+        for p in \
+          luci-app-firewall luci-app-package-manager luci-app-ttyd luci-app-cpufreq \
+          kmod-tun kmod-nft-tproxy luci-app-watchdog watchdog luci-app-autoreboot \
+          luci-app-ramfree luci-app-wrtbwmon wrtbwmon luci-app-onliner luci-app-3ginfo-lite \
+          luci-app-sms-tool luci-app-poweroffdevice luci-app-taskplan luci-app-socat \
+          luci-app-droidmodem luci-app-systools luci-app-wifischedule btop \
+          luci-app-passwall2 chinadns-ng luci-proto-wireguard kmod-wireguard wireguard-tools \
+          luci-app-zerotier zerotier luci-app-frpc frpc luci-app-ddns-go ddns-go \
+          luci-app-eqos luci-app-smartdns smartdns luci-app-autorepeater luci-app-wan-mac \
+          docker dockerd luci-app-dockerman kmod-br-netfilter kmod-dummy docker-lan-bridge \
+          kmod-usb-storage kmod-usb-storage-uas kmod-usb2 kmod-usb3 usbutils block-mount \
+          luci-app-diskman luci-app-ksmbd luci-app-alist alist luci-app-lucky lucky \
+          luci-app-usb-printer p910nd ; do
+          grep -q "^CONFIG_PACKAGE_${p}=y" .config || MISS="$MISS $p"
+        done
+        if [ -n "$MISS" ]; then
+          echo "::error::以下包没能进入 .config，说明 feed 里不存在或依赖未满足：$MISS"
+          echo "→ 换 name 或从清单里删掉后重跑，别让它白编 4 小时"
+          exit 1
+        fi
+        echo "✅ 固化清单全部就位"
+        echo "---- 代理/核心相关 ----"
+        grep -E '^CONFIG_PACKAGE_(luci-app-passwall2?|.*INCLUDE.*|xray-core|sing-box|shadowsocks)' .config || true
+
+    - name: Sanity check libffi
+      run: |
+        cd openwrt
+        test -f package/libs/libffi/Makefile || { echo "::error::libffi 包缺失"; exit 1; }
+        grep -q '^PKG_NAME:=libffi' package/libs/libffi/Makefile || { echo "::error::libffi Makefile 异常"; exit 1; }
+        echo "libffi 包已就位"
+        grep -E 'CONFIG_PACKAGE_(libffi|glib2)' .config || echo "::warning::配置里没有 libffi/glib2，说明本次不会触发该依赖"
+        echo "---- 被依赖自动拉进来的重量级包（不是 extra_packages 显式指定的）----"
+        grep -E '^CONFIG_PACKAGE_(docker|docker-compose|containerd|runc|tini|ucode-mod-socket|rust|shadowsocks-rust|sing-box|xray-core|v2ray-core|naiveproxy)=' .config || true
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make download -j4 V=s
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: 查看 openwrt 目录
+      run: |
+        ls -la openwrt/
+        ls -l openwrt/.config
+
+    - name: 自动上传最新源码生成.config编译配置
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-config
+        path: |
+          ${{ github.workspace }}/openwrt/.config
+          ${{ github.workspace }}/openwrt/feeds.conf.default
+        include-hidden-files: true
+
+    # 原来的 `make -jN || make -j1` 会吞掉并行编译错误，
+    # -j1 侥幸成功还会误判为 success，这里改成硬失败 + 只留日志尾巴。
+    - name: Check disk before compile
+      run: |
+        echo "=== 编译前可用空间 ==="
+        df -hT /mnt
+        AVAIL=$(df -BG --output=avail /mnt | tail -1 | tr -dc '0-9')
+        echo "可用空间: ${AVAIL} GB"
+        if [ "${AVAIL:-0}" -lt 20 ]; then
+          echo "::error::可用空间只剩 ${AVAIL}GB。OpenWrt 全量编译（rust + docker 全家）峰值要 25GB 以上，继续跑必然在打包阶段爆盘，而且报出来的是一堆看不懂的 Error 2"
+          exit 1
+        fi
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo "$(nproc) thread compile"
+
+        # ★ base-files 必须先单独装进 root-msm89xx
+        # base-files 的 install 会往 root 里放 /var -> tmp 的符号链接；
+        # 而 dbus（被 modemmanager 依赖，modemmanager 又由 luci-app-droidmodem 带进来）
+        # 的 .pkgdir 里带真实目录 var/lib/dbus。并行 -jN 时 dbus 抢先装，
+        # root 里的 /var 变成真目录，base-files 再放符号链接就直接报：
+        #   cp: cannot overwrite directory '.../root-msm89xx/./var' with non-directory
+        #   make[3]: *** [.../stamp/.base-files_installed] Error 1
+        # 先把 base-files 装好，后面所有包都会顺着 /var -> tmp 写，不会再撞。
+        if ! make -j$(nproc) V=s package/base-files/compile > base-files.log 2>&1; then
+          echo "::error::base-files 预装失败（toolchain + base-files）"
+          grep -nE "^ERROR:|error:|Error [0-9]+$" base-files.log | tail -20 || true
+          tail -60 base-files.log
+          exit 1
+        fi
+        echo "✅ base-files 已预装："
+        ls -ld staging_dir/target-*/root-*/var 2>/dev/null || true
+
+        if ! make -j$(nproc) V=s > build.log 2>&1; then
+          echo "::error::编译失败。并行编译时错误在日志中间，tail 只能看到最后收尾的包，下面按优先级抓真因"
+          echo
+          echo "########## 1. 磁盘 ##########"
+          df -hT /mnt / 2>/dev/null || df -hT
+          echo
+          echo "########## 2. OpenWrt 自己点名的失败包（最准，先看这个）##########"
+          grep -nE "^ERROR: .*failed to build" build.log | head -20 || true
+          echo
+          echo "########## 3. 最早的 3 处 make Error（失败起点）##########"
+          grep -nE "^make\[[0-9]+\]: \*\*\* .*Error [0-9]+$" build.log | head -3 || true
+          echo
+          echo "########## 4. 编译错误关键字 ##########"
+          grep -nE "error:|fatal error:|undefined reference|cannot find -l|No rule to make target|Permission denied" build.log | tail -40 || true
+          echo
+          echo "########## 5. 资源类失败（OOM / 空间 / 被 kill）##########"
+          grep -nE "No space left on device|Cannot allocate memory|virtual memory exhausted|Killed signal|Killed process|out of memory|oom-kill|Error 137" build.log | tail -20 || true
+          echo
+          echo "########## 6. 各包耗时 Top10（谁在吃时间）##########"
+          grep -E "^time: " build.log | sort -t'#' -k2 -rn | head -10 || true
+          echo
+          echo "########## 7. 最早失败点前 60 行上下文 ##########"
+          FIRST=$(grep -nE "^make\[[0-9]+\]: \*\*\* .*Error [0-9]+$" build.log | head -1 | cut -d: -f1)
+          if [ -n "$FIRST" ]; then
+            S=$((FIRST-60))
+            if [ "$S" -lt 1 ]; then S=1; fi
+            echo "----- build.log 第 $S-$FIRST 行 -----"
+            sed -n "${S},${FIRST}p" build.log
+          else
+            echo "日志里没有 make Error 行，可能是超时 / 被 runner 回收，看 build.log 最后 50 行"
+            tail -50 build.log || true
+          fi
+          exit 1
+        fi
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Upload build log on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log
+        path: openwrt/build.log
+        if-no-files-found: ignore
+
+    - name: Get kernel version
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        KERNEL_VER=$(cat /mnt/openwrt/build_dir/target-*/linux-*/linux-*/.kernelversion 2>/dev/null | head -1 || echo "未知")
+        echo "KERNEL_VER=$KERNEL_VER" >> $GITHUB_ENV
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Fix Git buffer
+      run: git config --global http.postBuffer 524288000
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@v4
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+
+    # 原条件是 `!cancelled()`，编译失败也会进来，于是报“固件文件未找到”这个二次伤害
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && steps.compile.outputs.status == 'success' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+
+        # 创建刷机包目录并打包 zip
+        mkdir -p flash_package
+        for IMG in boot system; do
+          SRC=$(ls *${IMG}.img.gz *${IMG}.img 2>/dev/null | head -1)
+          if [ -z "$SRC" ]; then
+            echo "::error::缺少 ${IMG}.img，当前目录："
+            ls -la
+            exit 1
+          fi
+          case "$SRC" in
+            *.gz) gzip -dc "$SRC" > flash_package/${IMG}.img ;;
+            *)    cp "$SRC" flash_package/${IMG}.img ;;
+          esac
+          echo "✅ ${IMG}.img <= $SRC"
+        done
+
+        if [ -d "$GITHUB_WORKSPACE/刷机脚本" ]; then
+          cp -r "$GITHUB_WORKSPACE/刷机脚本/." flash_package/
+        else
+          echo "::warning::缺少 刷机脚本 目录"
+        fi
+
+        # 确保 bat 文件是 CRLF 换行（Windows 兼容）
+        if ls flash_package/*.bat >/dev/null 2>&1; then
+          sed -i 's/\r$//' flash_package/*.bat
+          sed -i 's/$/\r/' flash_package/*.bat
+        fi
+
+        ZIP_NAME="OpenWrt_${PROFILE}${{ env.FILE_DATE }}_刷机包.zip"
+        cd flash_package && zip -r "../$ZIP_NAME" . && cd ..
+
+        # 整理 release 目录：zip + 单独固件 + 编译信息
+        mkdir -p release_files
+        mv "$ZIP_NAME" release_files/
+        cp *.manifest release_files/ 2>/dev/null || true
+        cp *.buildinfo release_files/ 2>/dev/null || true
+        cp sha256sums release_files/ 2>/dev/null || true
+
+        echo "FIRMWARE=$PWD/release_files" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@v4
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        RAW="$EXTRA_PACKAGES"
+        CUSTOM_IP=$(echo "$RAW" | grep -oP '(?<=__ip__)[^,\s]+' || true)
+        CUSTOM_HOSTNAME=$(echo "$RAW" | grep -oP '(?<=__hostname__)[^,\s]+' || true)
+        DISPLAY_IP=${CUSTOM_IP:-192.168.1.1}
+        DISPLAY_HOSTNAME=${CUSTOM_HOSTNAME:-ImmortalWrt}
+        # 过滤掉特殊前缀，只显示真正的包名
+        EXTRA=$(echo "$RAW" | sed 's/,/ /g' | tr ' ' '\n' | grep -v '^__ip__' | grep -v '^__hostname__' | sed '/^$/d')
+
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")-${PROFILE}" >> $GITHUB_OUTPUT
+        touch release.txt
+        {
+          echo "## Immortalwrt master分支 高通410系列 · ${PROFILE}"
+          echo ""
+          echo "| 项目 | 信息 |"
+          echo "|------|------|"
+          echo "| 编译者 | ${{ github.actor }} |"
+          echo "| 机型 | ${PROFILE} |"
+          echo "| 内核版本 | ${{ env.KERNEL_VER }} |"
+          echo "| 管理地址 | ${DISPLAY_IP} |"
+          echo "| 主机名 | ${DISPLAY_HOSTNAME} |"
+          echo "| 默认用户 | root |"
+          echo "| 默认密码 | 空 |"
+          echo ""
+          if [ -n "$EXTRA" ]; then
+            echo "### 额外添加的包"
+            echo "$EXTRA" | sed 's/^/- /'
+          else
+            echo "### 额外添加的包"
+            echo "无"
+          fi
+        } >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Generate file list
+      if: env.UPLOAD_RELEASE == 'true' && steps.organize.outputs.status == 'success'
+      run: |
+        find ${{ env.FIRMWARE }} -type f > file_list.txt
+        echo "Collected files:"
+        cat file_list.txt
+        test -s file_list.txt || { echo "::error::No firmware files found"; exit 1; }
+
+    - name: Upload firmware to release
+      if: env.UPLOAD_RELEASE == 'true' && steps.organize.outputs.status == 'success'
+      uses: ncipollo/release-action@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag: ${{ steps.tag.outputs.release_tag }}
+        bodyFile: release.txt
+        artifacts: ${{ env.FIRMWARE }}/**/*
+        artifactErrorsFailBuild: false
+        allowUpdates: true
+        draft: false
+        prerelease: false
+
+    - name: Delete old workflow runs via GitHub API
+      if: always()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RETAIN_DAYS: 7
+        KEEP_MINIMUM_RUNS: 5
+      run: |
+        RUNS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=100")
+        CUTOFF=$(date -d "-${RETAIN_DAYS} days" +%s)
+        DEL_IDS=$(echo "$RUNS" | jq -r --arg cutoff "$CUTOFF" --argjson keep "$KEEP_MINIMUM_RUNS" '
+          [.workflow_runs[]
+            | select((now - (.created_at | fromdateiso8601)) > ($cutoff | tonumber))
+            | {id, created_at}
+          ]
+          | sort_by(.created_at)
+          | .[:-$keep]
+          | .[].id
+        ')
+        if [ -z "$DEL_IDS" ]; then
+          echo "No old runs to delete."
+        else
+          echo "$DEL_IDS" | while read run_id; do
+            echo "Deleting run $run_id"
+            curl -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/$run_id"
+          done
+        fi
