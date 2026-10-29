@@ -1,203 +1,469 @@
-name: Compile OpenWrt Firmware
+#
+#
+
+name: 🚀 Build_imm_高通410系列-new
 
 on:
-  # 允许手动触发编译，并显示交互界面
+  repository_dispatch:
   workflow_dispatch:
     inputs:
-      # 选项 1：选择预置的编译型号（你可以按需修改这里的列表）
-      target_model:
-        description: '选择编译型号'
-        required: true
-        default: 'immortalwrt'
+      ssh:
+        description: ' ← 选择是否开启 SSH 调试专业人员使用'
+        required: false
+        default: false
+        type: boolean
+      profile:
+        description: ' ↓ 支持多款型号 手动选择要编译的机型 ↓ '
         type: choice
         options:
-          - immortalwrt
-          - lede
-          - openwrt
-      # 选项 2：上传自定义的 .config 文件（如果选此选项，目标型号将被忽略）
-      upload_config:
-        description: '上传你的 .config 文件 (可选)'
+          - ufi003
+          - ufi001c
+          - ufi001b
+          - ufi103s
+          - jz02v10
+          - qrzl903
+          - w001
+          - uz801
+          - mf32
+          - mf601
+          - wf2
+          - sp970v11
+          - sp970v10
+        default: ufi003
+        required: true
+      upstream:
+        description: ' ↓ 选择上游源码仓库 ↓ '
+        type: choice
+        options:
+          - lkiuyu/immortalwrt
+        default: lkiuyu/immortalwrt
+        required: true
+      custom_hash:
+        description: ' ↓ 指定 hash（默认不用填写）↓ '
         required: false
-        type: string
         default: ''
-      # 选项 3：需要额外添加的插件/软件包
+        type: string
       extra_packages:
-        description: '额外安装的插件(多个用空格隔开，如: luci-app-passwall luci-app-adguardhome)'
+        description: ' ↓ 输入额外包名（逗号或空格分隔，留空则不添加任何额外包）↓ '
         required: false
-        type: string
         default: ''
-
-  # 允许仓库调度触发
-  repository_dispatch:
-    types: [compile]
+        type: string
 
 env:
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  REPO_URL: https://github.com/${{ github.event.inputs.upstream }}
+  REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: ${{ format('config/{0}.config', github.event.inputs.profile) }}
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
 
 jobs:
   build:
-    name: Compile Firmware (${{ github.event.inputs.target_model }})
-    runs-on: ubuntu-22.04
-
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
     steps:
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 10240
-          swap-size-mb: 10240
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
+    - name: 🚀 编译 (Build)
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    - name: Show hardware info
+      run: |
+        chmod 755 ./scripts/show_hardware_info.sh
+        ./scripts/show_hardware_info.sh
+  
+    - name: Free Disk Space (Ubuntu)
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: false
+        android: false
+        dotnet: false
+        haskell: false
+        large-packages: false
+        docker-images: false
+        swap-storage: true
+        
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo -E apt-get -y update
+        sudo -E apt-get -y install $(curl -fsSL https://raw.githubusercontent.com/xuxin1955/depend_ubuntu2204_openwrt/refs/heads/main/depend_ubuntu2204_openwrt)
 
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            flex \
-            bison \
-            g++ \
-            gawk \
-            gcc-multilib \
-            g++-multilib \
-            git \
-            gettext \
-            libncurses-dev \
-            libssl-dev \
-            python3-distutils \
-            python3-setuptools \
-            rsync \
-            swig \
-            time \
-            unzip \
-            zlib1g-dev \
-            file \
-            wget
+    - name: mkbootimg build
+      run: |
+        wget https://github.com/xuxin1955/depend_ubuntu2204_openwrt/releases/download/ubuntu_26.04_LTS_mkbootimg/mkbootimg_34.0.5-12build1_all.deb
+        sudo dpkg -i mkbootimg_34.0.5-12build1_all.deb
+        sudo apt-get install -f -y
+        # 验证安装
+        mkbootimg --help || true
+        MKBOOTIMG_PATH=$(which mkbootimg)
+        if [ -n "$MKBOOTIMG_PATH" ]; then
+        echo "mkbootimg found at: $MKBOOTIMG_PATH"
+        file "$MKBOOTIMG_PATH"
+        else
+        echo "❌ mkbootimg not found in PATH!"
+        fi
 
-      - name: Clean build environment
-        run: |
-          make clean
-          rm -rf build_dir staging_dir target/ dl/
+        sudo timedatectl set-timezone "$TZ"
+        sudo chmod 777 /mnt
+        df -hT
+        
+    - name: Ensure Python build tools
+      run: |
+       python3 -m pip cache purge
+       python3 -m pip install --upgrade --force-reinstall pip
+       python3 -m pip install --upgrade --force-reinstall 'setuptools>=65' wheel
+       python3 -m pip install --upgrade 'setuptools-scm>=8,<10'
+       python3 -m pip install --upgrade cython packaging tomli
+       python3 -m pip install Unidecode pyelftools
+       python3 -m pip --version
+       python3 -c "import setuptools.build_meta; print('setuptools.build_meta OK')"
 
-      - name: Update Feeds
-        run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
 
-      - name: Verify libffi dependency
-        run: |
-          if [ -d "./feeds/packages/libs/libffi" ]; then
-            echo "✅ libffi dependency found successfully!"
+
+    - name: 读取锁定的上游 hash (Read locked upstream hash)
+      id: lock
+      run: |
+        CUSTOM_HASH="${{ github.event.inputs.custom_hash }}"
+        LOCK_FILE="upstream_lock.txt"
+        if [ -n "$CUSTOM_HASH" ]; then
+          echo "locked_hash=$CUSTOM_HASH" >> $GITHUB_OUTPUT
+          echo "使用用户指定 hash: $CUSTOM_HASH"
+        elif [ -f "$LOCK_FILE" ]; then
+          HASH=$(cat $LOCK_FILE)
+          echo "locked_hash=$HASH" >> $GITHUB_OUTPUT
+          echo "使用锁定 hash: $HASH"
+        else
+          echo "locked_hash=" >> $GITHUB_OUTPUT
+          echo "upstream_lock.txt 不存在，使用最新 master"
+        fi
+
+    - name: Clone source code
+      working-directory: /mnt
+      run: |
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        if [ -n "${{ steps.lock.outputs.locked_hash }}" ]; then
+          cd openwrt && git checkout ${{ steps.lock.outputs.locked_hash }}
+        fi
+        ln -sf /mnt/openwrt $GITHUB_WORKSPACE/openwrt
+
+
+    - name:  files
+      run: cp -r files openwrt/files
+
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+        
+
+    - name: Clean build environment
+      working-directory: openwrt
+      run: |
+        echo "🧹 Cleaning build environment..."
+        make clean
+        rm -rf build_dir staging_dir target/ dl/
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Remove conflicting packages from smpackage
+      run: |
+        # 删除 small-package 中与系统冲突的包，避免编译报错（官方推荐操作）
+        rm -rf openwrt/feeds/smpackage/{base-files,dnsmasq,firewall*,fullconenat,libnftnl,nftables,ppp,opkg,ucl,upx,vsftpd*,miniupnpd-iptables,wireless-regdb}
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a -f
+
+    - name: Verify libffi dependency
+      run: |
+        echo "🔍 Verifying critical dependencies..."
+        if [ -d "./openwrt/feeds/packages/libs/libffi" ]; then
+          echo "✅ libffi dependency found successfully!"
+        elif [ -d "./openwrt/feeds/packages/net/libffi" ]; then
+          echo "✅ libffi dependency found (net/libffi)!"
+        else
+          echo "⚠️ Warning: libffi package not found in expected location"
+          echo "Searching for libffi..."
+          find ./openwrt/feeds -name "libffi" -type d 2>/dev/null || echo "libffi not found in feeds"
+          echo "Continuing anyway - may fail during compilation if libffi is required"
+        fi
+
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Install extra packages
+      if: ${{ inputs.extra_packages != '' }}
+      run: |
+        cd openwrt
+        echo "=========================================="
+        echo "User requested extra packages:"
+        echo "${{ inputs.extra_packages }}"
+        echo "=========================================="
+
+        # 提取系统设置参数（__ip__ 和 __hostname__ 前缀）
+        RAW='${{ inputs.extra_packages }}'
+        CUSTOM_IP=$(echo "$RAW" | grep -oP '(?<=__ip__)[^,\s]+' || true)
+        CUSTOM_HOSTNAME=$(echo "$RAW" | grep -oP '(?<=__hostname__)[^,\s]+' || true)
+
+        # 应用自定义 IP
+        if [ -n "$CUSTOM_IP" ]; then
+          echo "🌐 设置管理 IP: $CUSTOM_IP"
+          sed -i "s/192\.168\.1\.1/$CUSTOM_IP/g" package/base-files/files/bin/config_generate
+        fi
+
+        # 应用自定义主机名
+        if [ -n "$CUSTOM_HOSTNAME" ]; then
+          echo "🏷️ 设置主机名: $CUSTOM_HOSTNAME"
+          sed -i "s/set system\.@system\[0\]\.hostname='ImmortalWrt'/set system.@system[0].hostname='$CUSTOM_HOSTNAME'/" package/base-files/files/bin/config_generate || true
+          sed -i "s/option hostname 'ImmortalWrt'/option hostname '$CUSTOM_HOSTNAME'/" package/base-files/files/etc/config/system 2>/dev/null || true
+        fi
+
+        # 过滤掉特殊前缀，只处理真正的包名
+        PACKAGES=$(echo "$RAW" | sed 's/,/ /g' | tr ' ' '\n' | grep -v '^__ip__' | grep -v '^__hostname__' | tr '\n' ' ')
+
+        # 检测是否选了 turboacc，如果选了则先执行安装脚本
+        if echo "$PACKAGES" | grep -qw "luci-app-turboacc"; then
+          echo "⚡ 检测到 luci-app-turboacc，执行 turboacc 安装脚本..."
+          curl -sSL https://raw.githubusercontent.com/mufeng05/turboacc/main/add_turboacc.sh -o add_turboacc.sh && bash add_turboacc.sh || echo "⚠️ turboacc 脚本执行失败，跳过"
+        fi
+
+        for pkg in $PACKAGES; do
+          if [ -n "$pkg" ]; then
+            CFG="CONFIG_PACKAGE_${pkg}"
+            if grep -q "^# ${CFG} is not set" .config; then
+              sed -i "s/^# ${CFG} is not set$/${CFG}=y/" .config
+              echo "✅ Enabled (replaced): ${CFG}=y"
+            elif grep -q "^${CFG}=" .config; then
+              sed -i "s/^${CFG}=.*$/${CFG}=y/" .config
+              echo "✅ Enabled (updated): ${CFG}=y"
+            else
+              echo "${CFG}=y" >> .config
+              echo "✅ Enabled (appended): ${CFG}=y"
+            fi
+          fi
+        done
+        
+        
+    - name: SSH 调试有效时间6h! 连接后输入q 输入exit即可退出，自动继续后续编译流程
+      uses: mxschmitt/action-tmate@v3
+      if: ${{ inputs.ssh == true }}
+      
+      
+    - name: Config defconfig
+      id: config
+      run: |
+       cd openwrt
+       make defconfig
+       
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make download -j4 V=s
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: 查看 openwrt 目录
+      run: ls -la openwrt/
+      
+           ls -l .config
+      
+           ls -la openwrt/.config
+
+ 
+    - name: 自动上传最新源码生成.config编译配置
+      uses: actions/upload-artifact@v4
+      with:
+       name: build-config
+       path: |
+         ${{ github.workspace }}/openwrt/.config
+         ${{ github.workspace }}/openwrt/feeds.conf.default
+       include-hidden-files: true
+
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 V=s
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Get kernel version
+      run: |
+        KERNEL_VER=$(cat /mnt/openwrt/build_dir/target-*/linux-*/linux-*/.kernelversion 2>/dev/null | head -1 || echo "未知")
+        echo "KERNEL_VER=$KERNEL_VER" >> $GITHUB_ENV
+
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Fix Git buffer
+      run: git config --global http.postBuffer 524288000
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@v4
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        PROFILE=${{ github.event.inputs.profile }}
+
+        # 创建刷机包目录并打包 zip
+        mkdir -p flash_package
+        BOOT_IMG=$(ls *boot.img.gz *boot.img 2>/dev/null | head -1)
+        SYSTEM_IMG=$(ls *system.img.gz *system.img 2>/dev/null | head -1)
+        if [ -z "$BOOT_IMG" ] || [ -z "$SYSTEM_IMG" ]; then
+          echo "::error::固件文件未找到，编译可能失败！当前目录文件："
+          ls -la
+          exit 1
+        fi
+        cp "$BOOT_IMG" flash_package/boot.img.gz
+        cp "$SYSTEM_IMG" flash_package/system.img.gz
+        # 解压供刷机脚本使用
+        gzip -dk flash_package/boot.img.gz
+        gzip -dk flash_package/system.img.gz
+        rm flash_package/boot.img.gz flash_package/system.img.gz
+        cp -r $GITHUB_WORKSPACE/刷机脚本/. flash_package/
+        # 确保 bat 文件是 CRLF 换行（Windows 兼容）
+        unix2dos flash_package/*.bat 2>/dev/null || sed -i 's/\r//' flash_package/*.bat && sed -i 's/$/\r/' flash_package/*.bat
+        ZIP_NAME="OpenWrt_${PROFILE}${{ env.FILE_DATE }}_刷机包.zip"
+        cd flash_package && zip -r "../$ZIP_NAME" . && cd ..
+
+        # 整理 release 目录：zip + 单独固件 + 编译信息
+        mkdir -p release_files
+        mv "$ZIP_NAME" release_files/
+        cp *.manifest release_files/ 2>/dev/null || true
+        cp *.buildinfo release_files/ 2>/dev/null || true
+        cp sha256sums release_files/ 2>/dev/null || true
+
+        echo "FIRMWARE=$PWD/release_files" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@v4
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        PROFILE=${{ github.event.inputs.profile }}
+        # 提取用户设置的 IP 和主机名
+        RAW='${{ inputs.extra_packages }}'
+        CUSTOM_IP=$(echo "$RAW" | grep -oP '(?<=__ip__)[^,\s]+' || true)
+        CUSTOM_HOSTNAME=$(echo "$RAW" | grep -oP '(?<=__hostname__)[^,\s]+' || true)
+        DISPLAY_IP=${CUSTOM_IP:-192.168.1.1}
+        DISPLAY_HOSTNAME=${CUSTOM_HOSTNAME:-ImmortalWrt}
+        # 过滤掉特殊前缀，只显示真正的包名
+        EXTRA=$(echo "$RAW" | sed 's/,/ /g' | tr ' ' '\n' | grep -v '^__ip__' | grep -v '^__hostname__' | sed '/^$/d')
+
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")-${PROFILE}" >> $GITHUB_OUTPUT
+        touch release.txt
+        {
+          echo "## Immortalwrt master分支 高通410系列 · ${PROFILE}"
+          echo ""
+          echo "| 项目 | 信息 |"
+          echo "|------|------|"
+          echo "| 编译者 | ${{ github.actor }} |"
+          echo "| 机型 | ${PROFILE} |"
+          echo "| 内核版本 | ${{ env.KERNEL_VER }} |"
+          echo "| 管理地址 | ${DISPLAY_IP} |"
+          echo "| 主机名 | ${DISPLAY_HOSTNAME} |"
+          echo "| 默认用户 | root |"
+          echo "| 默认密码 | 空 |"
+          echo ""
+          if [ -n "$EXTRA" ]; then
+            echo "### 额外添加的包"
+            echo "$EXTRA" | sed 's/^/- /'
           else
-            echo "❌ Critical Error: libffi package is missing in feeds!"
-            echo "Please ensure your source code (fork) is synced with the latest upstream."
-            exit 1
+            echo "### 额外添加的包"
+            echo "无"
           fi
+        } >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
 
-      - name: Load Custom Configuration
-        run: |
-          # 逻辑修改：优先使用你在 Actions 界面上传的 .config，如果没有则使用仓库默认的
-          if [ -n "${{ github.event.inputs.upload_config }}" ]; then
-            echo "📥 Using user-uploaded .config..."
-            echo "${{ github.event.inputs.upload_config }}" > .config
-          else
-            echo "📥 Using repository default .config..."
-            cp .config .config_original
-          fi
 
-      - name: Modify config & add packages
-        run: |
-          # 自动添加用户在界面填写的插件
-          if [ -n "${{ github.event.inputs.extra_packages }}" ]; then
-            echo "Adding extra packages: ${{ github.event.inputs.extra_packages }}"
-            for package in ${{ github.event.inputs.extra_packages }}; do
-              sed -i "s/# CONFIG_PACKAGE_${package} is not set/CONFIG_PACKAGE_${package}=m/g" .config
-            done
-          fi
 
-      - name: Make defconfig
-        run: |
-          make defconfig
-          make download -j$(nproc)
-          find dl -size -1024c -exec ls -l {} \;
-          find dl -size -1024c -exec rm -f {} \;
+    - name: Generate file list
+      if: env.UPLOAD_RELEASE == 'true' && steps.organize.outputs.status == 'success'
+      run: |
+        find ${{ env.FIRMWARE }} -type f > file_list.txt
+        echo "Collected files:"
+        cat file_list.txt
+        test -s file_list.txt || { echo "::error::No firmware files found"; exit 1; }
 
-      - name: Compile Firmware
-        id: compile
-        run: |
-          echo "Starting compile firmware..."
-          make -j$(nproc) V=s
-          echo "status=success" >> $GITHUB_OUTPUT
-        continue-on-error: true
 
-      - name: Debug SSH (On failure)
-        if: ${{ steps.compile.outcome == 'failure' }}
-        uses: mxschmitt/action-tmate@v3
-        timeout-minutes: 60
-        with:
-          limit-access-to-actor: true
-          limit-access-to-users: ${{ github.actor }}
 
-      - name: Upload Bin Directory
-        if: steps.compile.outputs.status == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: Bin-Directories
-          path: ./bin
+    - name: Upload firmware to release
+      if: env.UPLOAD_RELEASE == 'true' && steps.organize.outputs.status == 'success'
+      uses: ncipollo/release-action@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag: ${{ steps.tag.outputs.release_tag }}
+        bodyFile: release.txt
+        artifacts: ${{ env.FIRMWARE }}/**/*
+        artifactErrorsFailBuild: false
+        allowUpdates: true
+        draft: false
+        prerelease: false
 
-      - name: Generate Release Tag
-        id: generate_tag
-        run: |
-          echo "release_tag=$(date +%Y.%m.%d)-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "release_date=$(date '+%Y年%m月%d日 %H点%M分')" >> $GITHUB_OUTPUT
-          echo "status=success" >> $GITHUB_OUTPUT
-        if: steps.compile.outputs.status == 'success'
-
-      - name: Generate File List
-        id: file_list
-        run: |
-          echo "### Firmware Information" >> release.md
-          echo "" >> release.md
-          echo "🔢 Firmware version: ${{ steps.generate_tag.outputs.release_tag }}" >> release.md
-          echo "📅 Date: ${{ steps.generate_tag.outputs.release_date }}" >> release.md
-          echo "👨‍💻 Author: ${{ github.actor }}" >> release.md
-          echo "🏠 Repository: ${{ github.repository }}" >> release.md
-          echo "⚙️ Compile Workflow: ${{ github.workflow }}" >> release.md
-          echo "" >> release.md
-          echo "### Firmware List" >> release.md
-          echo "" >> release.md
-          for i in bin/targets/*/*/*.img.gz; do
-            echo "🔹 $i" >> release.md
+    - name: Delete old workflow runs via GitHub API
+      if: always()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RETAIN_DAYS: 7
+        KEEP_MINIMUM_RUNS: 5
+      run: |
+        RUNS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          "https://api.github.com/repos/${{ github.repository }}/actions/runs?per_page=100")
+        CUTOFF=$(date -d "-${RETAIN_DAYS} days" +%s)
+        DEL_IDS=$(echo "$RUNS" | jq -r --arg cutoff "$CUTOFF" --argjson keep "$KEEP_MINIMUM_RUNS" '
+          [.workflow_runs[]
+            | select((now - (.created_at | fromdateiso8601)) > ($cutoff | tonumber))
+            | {id, created_at}
+          ]
+          | sort_by(.created_at)
+          | .[:-$keep]
+          | .[].id
+        ')
+        if [[ -z "$DEL_IDS" ]]; then
+          echo "No old runs to delete."
+        else
+          echo "$DEL_IDS" | while read run_id; do
+            echo "Deleting run $run_id"
+            curl -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/$run_id"
           done
-          for i in bin/targets/*/*/*.ext4.gz; do
-            echo "🔹 $i" >> release.md
-          done
-          for i in bin/targets/*/*/*.rootfs.tar.gz; do
-            echo "🔹 $i" >> release.md
-          done
-          echo "status=success" >> $GITHUB_OUTPUT
-        if: steps.compile.outputs.status == 'success'
-
-      - name: Upload Firmware to Release
-        uses: ncipollo/release-action@v1
-        if: steps.compile.outputs.status == 'success'
-        with:
-          artifacts: "bin/targets/*/*/*.img.gz,bin/targets/*/*/*.ext4.gz,bin/targets/*/*/*.rootfs.tar.gz,bin/targets/*/packages/*.ipk"
-          name: "OpenWrt Release ${{ steps.generate_tag.outputs.release_tag }}"
-          tag: ${{ steps.generate_tag.outputs.release_tag }}
-          bodyFile: "release.md"
-          allowUpdates: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Delete old workflow runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          retain_days: 1
-          keep_minimum_runs: 1
+        fi
