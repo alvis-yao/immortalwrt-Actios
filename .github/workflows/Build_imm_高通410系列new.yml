@@ -1,19 +1,42 @@
 name: Compile OpenWrt Firmware
 
 on:
-  # 允许手动触发编译
+  # 允许手动触发编译，并显示交互界面
   workflow_dispatch:
-  # 允许通过仓库调度触发 (例如通过 API 或仓库事件)
+    inputs:
+      # 选项 1：选择预置的编译型号（你可以按需修改这里的列表）
+      target_model:
+        description: '选择编译型号'
+        required: true
+        default: 'immortalwrt'
+        type: choice
+        options:
+          - immortalwrt
+          - lede
+          - openwrt
+      # 选项 2：上传自定义的 .config 文件（如果选此选项，目标型号将被忽略）
+      upload_config:
+        description: '上传你的 .config 文件 (可选)'
+        required: false
+        type: string
+        default: ''
+      # 选项 3：需要额外添加的插件/软件包
+      extra_packages:
+        description: '额外安装的插件(多个用空格隔开，如: luci-app-passwall luci-app-adguardhome)'
+        required: false
+        type: string
+        default: ''
+
+  # 允许仓库调度触发
   repository_dispatch:
     types: [compile]
 
 env:
-  # 定义 GitHub API 的认证 Token，用于删除旧的运行记录
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   build:
-    name: Compile Firmware
+    name: Compile Firmware (${{ github.event.inputs.target_model }})
     runs-on: ubuntu-22.04
 
     steps:
@@ -30,7 +53,6 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
-          # 关键修复：获取完整的 Git 历史记录，确保子模块能正确更新
           fetch-depth: 0
 
       - name: Install Dependencies
@@ -61,20 +83,16 @@ jobs:
 
       - name: Clean build environment
         run: |
-          # 清理可能存在的旧构建缓存和脏数据
           make clean
           rm -rf build_dir staging_dir target/ dl/
 
       - name: Update Feeds
         run: |
-          # 更新所有 feeds
           ./scripts/feeds update -a
-          # 关键修复：移除了 -f 参数，强制检查依赖，防止掩藏 libffi 缺失的错误
           ./scripts/feeds install -a
 
       - name: Verify libffi dependency
         run: |
-          # 关键修复：编译前检查 libffi 包是否存在
           if [ -d "./feeds/packages/libs/libffi" ]; then
             echo "✅ libffi dependency found successfully!"
           else
@@ -83,14 +101,27 @@ jobs:
             exit 1
           fi
 
-      - name: Load Custom Config
+      - name: Load Custom Configuration
         run: |
-          # 确保你的仓库根目录下有 .config 文件，或者在这里使用 curl/wget 下载
-          [ -f .config ] && mv .config .config.bak
-          # 你可以在这里放你的 config 内容，或者在 Actions Secrets/Variables 里配置
-          # 如果你把 .config 放在了仓库里，这行不需要动；如果是 secrets，使用以下方式：
-          # echo "${{ secrets.CONFIG_FILE }}" > .config
-          
+          # 逻辑修改：优先使用你在 Actions 界面上传的 .config，如果没有则使用仓库默认的
+          if [ -n "${{ github.event.inputs.upload_config }}" ]; then
+            echo "📥 Using user-uploaded .config..."
+            echo "${{ github.event.inputs.upload_config }}" > .config
+          else
+            echo "📥 Using repository default .config..."
+            cp .config .config_original
+          fi
+
+      - name: Modify config & add packages
+        run: |
+          # 自动添加用户在界面填写的插件
+          if [ -n "${{ github.event.inputs.extra_packages }}" ]; then
+            echo "Adding extra packages: ${{ github.event.inputs.extra_packages }}"
+            for package in ${{ github.event.inputs.extra_packages }}; do
+              sed -i "s/# CONFIG_PACKAGE_${package} is not set/CONFIG_PACKAGE_${package}=m/g" .config
+            done
+          fi
+
       - name: Make defconfig
         run: |
           make defconfig
@@ -158,7 +189,7 @@ jobs:
         uses: ncipollo/release-action@v1
         if: steps.compile.outputs.status == 'success'
         with:
-          artifacts: "bin/targets/*/*/*.img.gz,bin/targets/*/*/*.ext4.gz,bin/targets/*/*/*.rootfs.tar.gz,bin/targets/*/*/packages/*.ipk"
+          artifacts: "bin/targets/*/*/*.img.gz,bin/targets/*/*/*.ext4.gz,bin/targets/*/*/*.rootfs.tar.gz,bin/targets/*/packages/*.ipk"
           name: "OpenWrt Release ${{ steps.generate_tag.outputs.release_tag }}"
           tag: ${{ steps.generate_tag.outputs.release_tag }}
           bodyFile: "release.md"
