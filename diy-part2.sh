@@ -10,27 +10,35 @@
 sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' feeds/luci/collections/luci/Makefile 2>/dev/null || true
 
 # ==========================================================
-# 物理删除 smpackage 的 luci-app-wrtbwmon
+# 物理删除 smpackage 的 wrtbwmon 全家桶
 #
-# 这个包 LUCI_PKGARCH:=all，却在 root/ 里把 wrtbwmon 守护进程整套打进去：
-#   /etc/config/wrtbwmon、/etc/init.d/wrtbwmon、/usr/sbin/wrtbwmon、
-#   /usr/sbin/readDB.awk、/usr/share/wrtbwmon/usage.htm1|htm2
-# 再装 wrtbwmon 本体 → opkg 装 rootfs 阶段报 check_data_file_clashes，整次构建失败。
+# luci-app-wrtbwmon：LUCI_PKGARCH:=all，却在 root/ 里把 wrtbwmon 守护进程整套
+# 打进去（/etc/config/wrtbwmon、/etc/init.d/wrtbwmon、/usr/sbin/wrtbwmon、
+# /usr/sbin/readDB.awk、/usr/share/wrtbwmon/usage.htm1|htm2）。
+# 它 LUCI_DEPENDS:=+wrtbwmon 又 select wrtbwmon 本体 → 两个 ipk 装同一批文件，
+# opkg 装 rootfs 阶段报 check_data_file_clashes，整次构建失败。
 #
-# 只在 config 里删掉 =y 行是不够的：包还在 feed 里，make defconfig 重新求值时
-# 仍有机会把它算回来（实测就出现过 .config 里 0 处 wrtbwmon、defconfig 后变 =y）。
-# 直接删包目录，让它在 kconfig 里根本不存在，才是根治。
+# luci-app-onliner：LUCI_DEPENDS:=+luci-app-wrtbwmon，是 wrtbwmon 的前台。
+# wrtbwmon 删了它就成了断链：编译能过，装 rootfs 时 opkg 报
+#   pkg_hash_check_unresolved: cannot find dependency luci-app-wrtbwmon for luci-app-onliner
+#   opkg_install_cmd: Cannot install package luci-app-onliner.
+# 所以必须一起删。
+#
+# 只在 config 里写 is not set 不够保险（万一 extra_packages 或别的包把它 select 回来），
+# 直接删包目录，让 kconfig 里根本不存在这些符号，才是根治。
 # ==========================================================
-for d in package/feeds/smpackage/luci-app-wrtbwmon feeds/smpackage/luci-app-wrtbwmon; do
-  if [ -e "$d" ] || [ -L "$d" ]; then
-    rm -rf "$d"
-    echo "✅ 已删除 $d（与 wrtbwmon 本体文件重叠，装 rootfs 必然冲突）"
+for pkg in luci-app-wrtbwmon luci-app-onliner; do
+  for d in "package/feeds/smpackage/$pkg" "feeds/smpackage/$pkg"; do
+    if [ -e "$d" ] || [ -L "$d" ]; then
+      rm -rf "$d"
+      echo "✅ 已删除 $d（wrtbwmon 冲突链）"
+    fi
+  done
+  if [ -e "feeds/smpackage/$pkg" ]; then
+    echo "::error::删除 feeds/smpackage/$pkg 失败，继续编译会在装 rootfs 时报错"
+    exit 1
   fi
 done
-if [ -e feeds/smpackage/luci-app-wrtbwmon ]; then
-  echo "::error::删除 feeds/smpackage/luci-app-wrtbwmon 失败，继续编译会在装 rootfs 时报文件冲突"
-  exit 1
-fi
 
 # ==========================================================
 # luci-app-poweroffdevice：不在任何已配置的 feed 里
