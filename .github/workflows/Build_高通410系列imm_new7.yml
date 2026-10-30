@@ -397,8 +397,9 @@ jobs:
         MISS=""
         for p in \
           luci-app-firewall luci-app-package-manager luci-app-ttyd luci-app-cpufreq \
+          luci-i18n-base-zh-cn \
           kmod-tun kmod-nft-tproxy luci-app-watchdog watchdog luci-app-autoreboot \
-          luci-app-ramfree luci-app-wrtbwmon wrtbwmon luci-app-onliner luci-app-3ginfo-lite \
+          luci-app-ramfree luci-app-onliner luci-app-3ginfo-lite \
           luci-app-sms-tool luci-app-poweroffdevice luci-app-taskplan luci-app-socat \
           luci-app-droidmodem luci-app-systools luci-app-wifischedule btop \
           luci-app-passwall2 chinadns-ng luci-proto-wireguard kmod-wireguard wireguard-tools \
@@ -407,8 +408,28 @@ jobs:
           docker dockerd luci-app-dockerman kmod-br-netfilter kmod-dummy docker-lan-bridge \
           kmod-usb-storage kmod-usb-storage-uas kmod-usb2 kmod-usb3 usbutils block-mount \
           luci-app-diskman luci-app-ksmbd luci-app-alist alist luci-app-lucky lucky \
-          luci-app-usb-printer p910nd ; do
+          luci-app-usb-printer p910nd \
+          luci-app-adblock luci-app-nlbwmon luci-app-vnstat2 luci-app-hd-idle \
+          luci-app-vsftpd luci-app-arpbind ; do
           grep -q "^CONFIG_PACKAGE_${p}=y" .config || MISS="$MISS $p"
+        done
+        # passwall2 只留 Xray 核心（aarch64 默认是 All，会多塞 sing-box；ss-rust 会触发
+        # rust host 交叉编译，实测单项 8371 秒），这两个断言必须成立
+        grep -q "^CONFIG_PACKAGE_luci-app-passwall2_Basic_Core_Xray=y" .config \
+          || MISS="$MISS (passwall2_Xray_core)"
+        for p in luci-app-passwall2_Basic_Core_All luci-app-passwall2_INCLUDE_Shadowsocks_Rust_Client; do
+          if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+            echo "::error::$p 被打开了。sing-box 多塞 38MB，ss-rust 会触发 rust host 编译多耗 2 小时 20 分，config 里的显式关闭没生效"
+            exit 1
+          fi
+        done
+        # wrtbwmon 与 luci-app-wrtbwmon 在 smpackage 里是同一个包体（luci 版把守护进程一起打了），
+        # 两个都选会在装 rootfs 时报 check_data_file_clashes，实测就是这么炸的，别再加回来。
+        for p in luci-app-wrtbwmon wrtbwmon; do
+          if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+            echo "::error::$p 又回到了 .config 里。它俩文件完全重叠，装 rootfs 会报 check_data_file_clashes: Package wrtbwmon wants to install file .../etc/config/wrtbwmon, But that file is already provided by package luci-app-wrtbwmon"
+            exit 1
+          fi
         done
         if [ -n "$MISS" ]; then
           echo "::error::以下包没能进入 .config，说明 feed 里不存在或依赖未满足：$MISS"
@@ -428,6 +449,10 @@ jobs:
         grep -E 'CONFIG_PACKAGE_(libffi|glib2)' .config || echo "::warning::配置里没有 libffi/glib2，说明本次不会触发该依赖"
         echo "---- 被依赖自动拉进来的重量级包（不是 extra_packages 显式指定的）----"
         grep -E '^CONFIG_PACKAGE_(docker|docker-compose|containerd|runc|tini|ucode-mod-socket|rust|shadowsocks-rust|sing-box|xray-core|v2ray-core|naiveproxy)=' .config || true
+        echo "---- 谁声明了 node/host 或 rust/host 构建依赖（上一轮 node 单独吃了 3.4 小时，查它来源）----"
+        grep -rl --include=Makefile -e "node/host" -e "rust/host" -e "rust-bindgen/host" feeds 2>/dev/null | head -20 || true
+        echo "---- smartdns-ui 是否被选中（它是 node/rust 的已知触发点）----"
+        grep -E '^CONFIG_PACKAGE_smartdns-ui=' .config || echo "smartdns-ui 未选中"
 
     - name: Download package
       id: package
@@ -478,6 +503,9 @@ jobs:
           echo "########## 1. 磁盘 ##########"
           df -hT /mnt / 2>/dev/null || df -hT
           echo
+          echo "########## 2. 打包阶段的文件冲突（编译全过、装 rootfs 时才炸的那种）##########"
+          grep -nE "check_data_file_clashes|opkg_install_cmd: Cannot install package|Collected errors" build.log | head -40 || true
+          echo
           echo "########## 2. OpenWrt 自己点名的失败包（最准，先看这个）##########"
           grep -nE "^ERROR: .*failed to build" build.log | head -20 || true
           echo
@@ -510,6 +538,8 @@ jobs:
             echo '```text'
             echo "--- 磁盘 ---"
             df -h /mnt 2>/dev/null | tail -1 || true
+            echo "--- 文件冲突（opkg 装 rootfs 阶段，有内容就是它）---"
+            grep -E "opkg_install_cmd: Cannot install package|check_data_file_clashes" build.log | head -8 || true
             echo "--- 失败包（^ERROR:）---"
             grep -E "^ERROR: .*failed to build" build.log | head -10 || true
             echo "--- 最早 3 处 make Error ---"
