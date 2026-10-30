@@ -6,11 +6,31 @@
 # 版权: (c) 2019-2024 P3TERX <https://p3terx.com>
 # 基于 MIT 开源协议，详见 /LICENSE
 
-# 修改默认IP地址
-#sed -i 's/192.168.1.1/192.168.100.1/g' package/base-files/files/bin/config_generate
-
 # 修改默认主题为 argon（路径不存在时跳过，不中断编译）
 sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' feeds/luci/collections/luci/Makefile 2>/dev/null || true
+
+# ==========================================================
+# 物理删除 smpackage 的 luci-app-wrtbwmon
+#
+# 这个包 LUCI_PKGARCH:=all，却在 root/ 里把 wrtbwmon 守护进程整套打进去：
+#   /etc/config/wrtbwmon、/etc/init.d/wrtbwmon、/usr/sbin/wrtbwmon、
+#   /usr/sbin/readDB.awk、/usr/share/wrtbwmon/usage.htm1|htm2
+# 再装 wrtbwmon 本体 → opkg 装 rootfs 阶段报 check_data_file_clashes，整次构建失败。
+#
+# 只在 config 里删掉 =y 行是不够的：包还在 feed 里，make defconfig 重新求值时
+# 仍有机会把它算回来（实测就出现过 .config 里 0 处 wrtbwmon、defconfig 后变 =y）。
+# 直接删包目录，让它在 kconfig 里根本不存在，才是根治。
+# ==========================================================
+for d in package/feeds/smpackage/luci-app-wrtbwmon feeds/smpackage/luci-app-wrtbwmon; do
+  if [ -e "$d" ] || [ -L "$d" ]; then
+    rm -rf "$d"
+    echo "✅ 已删除 $d（与 wrtbwmon 本体文件重叠，装 rootfs 必然冲突）"
+  fi
+done
+if [ -e feeds/smpackage/luci-app-wrtbwmon ]; then
+  echo "::error::删除 feeds/smpackage/luci-app-wrtbwmon 失败，继续编译会在装 rootfs 时报文件冲突"
+  exit 1
+fi
 
 # ==========================================================
 # luci-app-poweroffdevice：不在任何已配置的 feed 里
