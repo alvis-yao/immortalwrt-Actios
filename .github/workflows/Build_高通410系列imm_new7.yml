@@ -398,26 +398,26 @@ jobs:
       id: config
       run: |
         cd openwrt
-        # 留证据：defconfig 前后各看一次 wrtbwmon 的状态。
-        # 拷进来的 .config 里明明没有这两个包，却能在 defconfig 后变成 =y，
-        # 到底是 config 带进来的还是 kconfig 算出来的，这两行一对比就清楚了。
-        echo "---- defconfig 之前，.config 里的 wrtbwmon ----"
-        grep -n "wrtbwmon" .config || echo "（无，符合预期：config 文件里已彻底删除）"
-        echo "---- feed 里这个包还在不在 ----"
-        ls -d feeds/smpackage/luci-app-wrtbwmon package/feeds/smpackage/luci-app-wrtbwmon 2>/dev/null \
+        # 留证据：defconfig 前后各看一次 wrtbwmon / onliner 的状态。
+        # 这两个包的目录已被 diy-part2.sh 物理删除，kconfig 里不该再有它们的符号；
+        # 万一还有 =y，上面两段日志一对比就能定位是谁写进来的。
+        echo "---- defconfig 之前，.config 里的 wrtbwmon / onliner ----"
+        grep -nE "wrtbwmon|onliner" .config || echo "（无 =y，符合预期）"
+        echo "---- feed 里这两个包目录还在不在 ----"
+        ls -d feeds/smpackage/luci-app-wrtbwmon feeds/smpackage/luci-app-onliner 2>/dev/null \
           || echo "（包目录已被 diy-part2.sh 删除，符合预期）"
 
         make defconfig
 
-        echo "---- defconfig 之后，.config 里的 wrtbwmon ----"
-        grep -n "wrtbwmon" .config || echo "（无）"
-        # 兜底：万一还有谁能把它算成 y，这里直接抹掉。
-        # 这个包和它依赖的 wrtbwmon 本体文件完全重叠，留着必然装不上 rootfs。
-        if grep -qE '^CONFIG_PACKAGE_(luci-app-)?wrtbwmon=' .config; then
-          echo "::warning::defconfig 之后 .config 里仍有 wrtbwmon，强制删除（上面两段日志可定位是谁写进来的）"
-          sed -i '/^CONFIG_PACKAGE_luci-app-wrtbwmon=/d; /^CONFIG_PACKAGE_wrtbwmon=/d' .config
+        echo "---- defconfig 之后，.config 里的 wrtbwmon / onliner ----"
+        grep -nE "wrtbwmon|onliner" .config || echo "（无）"
+        # 兜底：万一还有谁能把它们算成 y，这里直接抹掉。
+        # wrtbwmon 两包文件重叠装不上 rootfs；onliner 依赖已删的 wrtbwmon，链是断的。
+        if grep -qE '^CONFIG_PACKAGE_(luci-app-)?(wrtbwmon|onliner)' .config; then
+          echo "::warning::defconfig 之后 .config 里仍有 wrtbwmon/onliner，强制删除（上面两段日志可定位是谁写进来的）"
+          sed -i '/^CONFIG_PACKAGE_luci-app-wrtbwmon=/d; /^CONFIG_PACKAGE_wrtbwmon=/d; /^CONFIG_PACKAGE_luci-app-onliner=/d; /^CONFIG_PACKAGE_luci-i18n-onliner-zh-cn=/d' .config
           echo "---- 清理后 ----"
-          grep -n "wrtbwmon" .config || echo "（已清理干净）"
+          grep -nE "wrtbwmon|onliner" .config || echo "（已清理干净）"
         fi
 
     # 固化在 config/ufi103s.config 里的包，如果 feed 里没有，make defconfig 会静默丢弃，
@@ -439,7 +439,7 @@ jobs:
           luci-app-firewall luci-app-package-manager luci-app-ttyd luci-app-cpufreq \
           luci-i18n-base-zh-cn \
           kmod-tun kmod-nft-tproxy luci-app-watchdog watchdog luci-app-autoreboot \
-          luci-app-ramfree luci-app-onliner luci-app-3ginfo-lite \
+          luci-app-ramfree luci-app-3ginfo-lite \
           luci-app-sms-tool luci-app-poweroffdevice luci-app-taskplan luci-app-socat \
           luci-app-droidmodem luci-app-systools luci-app-wifischedule btop \
           luci-app-passwall2 chinadns-ng luci-proto-wireguard kmod-wireguard wireguard-tools \
@@ -463,15 +463,15 @@ jobs:
             exit 1
           fi
         done
-        # wrtbwmon 与 luci-app-wrtbwmon 在 smpackage 里是同一个包体（luci 版把守护进程一起打了），
-        # 两个都选会在装 rootfs 时报 check_data_file_clashes，实测就是这么炸的，别再加回来。
-        # diy-part2.sh 已经物理删掉 smpackage 里这个包目录，正常情况这里不该命中。
-        for p in luci-app-wrtbwmon wrtbwmon; do
+        # wrtbwmon 全家桶禁入名单：
+        #   luci-app-wrtbwmon 与 wrtbwmon 本体文件完全重叠 → check_data_file_clashes（第 4 次构建死因）
+        #   luci-app-onliner 的 LUCI_DEPENDS:=+luci-app-wrtbwmon → 依赖链断裂 opkg 装不上（第 6 次构建死因）
+        # 这三个包的目录已在 diy-part2.sh 里物理删除，正常情况这里不该命中。
+        for p in luci-app-wrtbwmon wrtbwmon luci-app-onliner luci-i18n-onliner-zh-cn; do
           if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
-            echo "::error::$p 出现在 .config 里，但 config/ufi103s.config 里没有它 → 来源是 defconfig 或 extra_packages"
+            echo "::error::$p 出现在 .config 里。wrtbwmon 两包文件重叠装不上 rootfs；onliner 依赖 wrtbwmon，链已断"
             echo "::error::本次 EXTRA_PACKAGES：${EXTRA_PACKAGES:-（空）}"
-            echo "::error::排查顺序：① 看上面 Config defconfig 步骤里「defconfig 之前」那行有没有它；② 确认 diy-part2.sh 是否删掉了 feeds/smpackage/luci-app-wrtbwmon"
-            echo "::error::它俩文件完全重叠，装 rootfs 会报 check_data_file_clashes: Package wrtbwmon wants to install file .../etc/config/wrtbwmon, But that file is already provided by package luci-app-wrtbwmon"
+            echo "::error::排查：① 看 Config defconfig 步骤里 defconfig 前后日志；② 确认 diy-part2.sh 删包段生效"
             exit 1
           fi
         done
