@@ -348,15 +348,39 @@ jobs:
     - name: Verify root /var patch
       run: |
         cd openwrt
-        # 补丁本体在 diy-part2.sh 里（改 include/package-pack.mk），这里只做校验，
-        # 缺了就立刻失败，别等到编译几十分钟后在 base-files 装 root 时炸。
-        if grep -qs "ROOT_VAR_FIX" include/package-pack.mk include/package-ipkg.mk; then
-          echo "✅ /var 软链冲突补丁已就位："
-          grep -n -A5 "ROOT_VAR_FIX" include/package-pack.mk include/package-ipkg.mk
-        else
-          echo "::error::构建系统里没有 ROOT_VAR_FIX 补丁（diy-part2.sh 未生效或上游改了结构）。缺了它，base-files 把 /var 换成软链时会撞上 dbus 已建的真目录，报 cp: cannot overwrite directory .../var"
+        # 补丁本体在 diy-part2.sh 里（改 include/package-pack.mk），这里只做校验。
+        # 注意：package-ipkg.mk 在新构建系统里已不存在，别再拿它当 grep 的参数——
+        # 文件不存在时 grep 返回 2，整个步骤会以 exit 2 失败（上一轮就是这么挂的）。
+        PMK=""
+        for f in include/package-pack.mk include/package-ipkg.mk; do
+          if [ -f "$f" ]; then PMK="$f"; break; fi
+        done
+        if [ -z "$PMK" ]; then
+          echo "::error::找不到 include/package-pack.mk，上游构建系统结构变了，需要人工确认"
           exit 1
         fi
+        echo "目标文件：$PMK"
+
+        if ! grep -q "ROOT_VAR_FIX" "$PMK"; then
+          echo "::error::$PMK 里没有 ROOT_VAR_FIX 补丁（diy-part2.sh 未生效或上游把 root-copy 行改了）。缺了它，base-files 把 /var 换成软链时会撞上 dbus 已建的真目录，报 cp: cannot overwrite directory .../var"
+          exit 1
+        fi
+
+        # 只校验「标记在不在」不够：补丁必须是 TAB 开头的单行 recipe，
+        # TAB 被换成空格 make 会直接报 missing separator。这里做精确匹配。
+        EXPECT=$(printf '\t@if [ -L $(PKG_BUILD_DIR)/.pkgdir/$(1)/var ]')
+        if ! grep -qF "$EXPECT" "$PMK"; then
+          echo "::error::/var 补丁格式不合法（TAB 或空格被破坏）。实际内容如下（^I 表示 TAB）："
+          grep -n -A2 "ROOT_VAR_FIX" "$PMK" | cat -A || true
+          exit 1
+        fi
+
+        echo "✅ /var 软链冲突补丁格式正确（^I = TAB）："
+        grep -n -A1 "ROOT_VAR_FIX" "$PMK" | cat -A
+        echo
+        echo "---- 补丁插入位置（下一行就是原来的 root-copy）----"
+        N=$(grep -n "ROOT_VAR_FIX" "$PMK" | head -1 | cut -d: -f1)
+        sed -n "$((N)),$((N+2))p" "$PMK" | cut -c1-150
 
     - name: Config defconfig
       id: config
