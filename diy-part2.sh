@@ -79,36 +79,52 @@ fi
 if grep -q 'ROOT_VAR_FIX' "$ROOTCOPY_FILE"; then
   echo "✅ /var 冲突补丁已存在（$ROOTCOPY_FILE），跳过"
 else
-  python3 - "$ROOTCOPY_FILE" <<'PYEOF'
-import sys
+  # 补丁只有两行，都必须是 TAB 开头（要插进 make 的 recipe 里，空格会让 make 报
+  # missing separator）。用 printf 显式写 \t，避免任何编辑器/传输把它变成空格。
+  # 守卫写成单行、不加反斜杠续行，省掉续行反斜杠在各层转义里出错的机会。
+  # 守卫文件用当前目录下的相对路径：mktemp 在某些环境下返回带反斜杠的
+  # Windows 路径（如 C:\Users\...\tmp.XXXX），传给 awk -v 会被当成转义序列
+  # （\U \l \T ...）导致路径被打断、getline 静默读不到内容。
+  GUARD_TMP=".root_var_guard.$$"
+  printf '\t# ROOT_VAR_FIX: pkg ships var as symlink, root already has a real var dir\n' > "$GUARD_TMP"
+  printf '\t@if [ -L $(PKG_BUILD_DIR)/.pkgdir/$(1)/var ] && [ -d $(STAGING_DIR_ROOT)/var ] && [ ! -L $(STAGING_DIR_ROOT)/var ]; then mkdir -p $(STAGING_DIR_ROOT)/tmp && cp -a $(STAGING_DIR_ROOT)/var/. $(STAGING_DIR_ROOT)/tmp/ 2>/dev/null || true; rm -rf $(STAGING_DIR_ROOT)/var; fi\n' >> "$GUARD_TMP"
 
-path = sys.argv[1]
-lines = open(path, encoding='utf-8').read().splitlines(keepends=True)
-idx = next((i for i, l in enumerate(lines)
-            if 'root-copy' in l and 'PKG_BUILD_DIR' in l), None)
-if idx is None:
-    sys.stderr.write('::error::%s 里找不到 root-copy 拷贝行，需要人工确认\n' % path)
-    sys.exit(1)
-
-target = lines[idx]
-indent = target[:len(target) - len(target.lstrip())] or '\t'
-guard = (
-    indent + '# ROOT_VAR_FIX: 包内 var 是软链、root 里 var 是真目录时 cp -fpR 会失败\n'
-    + indent + '@if [ -L $(PKG_BUILD_DIR)/.pkgdir/$(1)/var ] && [ -d $(STAGING_DIR_ROOT)/var ] && [ ! -L $(STAGING_DIR_ROOT)/var ]; then \\\n'
-    + indent + '\tmkdir -p $(STAGING_DIR_ROOT)/tmp; \\\n'
-    + indent + '\tcp -a $(STAGING_DIR_ROOT)/var/. $(STAGING_DIR_ROOT)/tmp/ 2>/dev/null || true; \\\n'
-    + indent + '\trm -rf $(STAGING_DIR_ROOT)/var; \\\n'
-    + indent + 'fi\n'
-)
-lines.insert(idx, guard)
-open(path, 'w', encoding='utf-8').write(''.join(lines))
-print('✅ 已向 %s 插入 ROOT_VAR_FIX（原第 %d 行之前）' % (path, idx + 1))
-PYEOF
-
-  if ! grep -q 'ROOT_VAR_FIX' "$ROOTCOPY_FILE"; then
-    echo "::error::/var 冲突补丁写入失败，继续编译会在 base-files 装 root 时报错"
+  if [ ! -s "$GUARD_TMP" ]; then
+    echo "::error::守卫文件写入失败（$GUARD_TMP），/var 冲突无法修复"
+    rm -f "$GUARD_TMP"
     exit 1
   fi
-  echo "---- 补丁内容 ----"
-  grep -n -A5 'ROOT_VAR_FIX' "$ROOTCOPY_FILE"
+
+  # 插到 $(call locked,$(CP) .../pkgdir/$(1)/. $(STAGING_DIR_ROOT)/,root-copy) 之前
+  awk -v guard="$GUARD_TMP" '
+    !done && /root-copy/ && /PKG_BUILD_DIR/ {
+      while ((getline line < guard) > 0) print line
+      close(guard)
+      done = 1
+    }
+    { print }
+  ' "$ROOTCOPY_FILE" > "$ROOTCOPY_FILE.new"
+
+  if [ ! -s "$ROOTCOPY_FILE.new" ] || ! grep -q 'root-copy' "$ROOTCOPY_FILE.new"; then
+    echo "::error::补丁插入失败（$ROOTCOPY_FILE 生成结果异常），已保留原文件"
+    rm -f "$ROOTCOPY_FILE.new" "$GUARD_TMP"
+    exit 1
+  fi
+  mv "$ROOTCOPY_FILE.new" "$ROOTCOPY_FILE"
+  rm -f "$GUARD_TMP"
+  echo "✅ 已向 $ROOTCOPY_FILE 插入 ROOT_VAR_FIX"
 fi
+
+# 双重校验：标记存在 + 守卫行以 TAB 开头且内容完整
+if ! grep -q 'ROOT_VAR_FIX' "$ROOTCOPY_FILE"; then
+  echo "::error::/var 冲突补丁写入失败，继续编译会在 base-files 装 root 时报错"
+  exit 1
+fi
+GUARD_EXPECT=$(printf '\t@if [ -L $(PKG_BUILD_DIR)/.pkgdir/$(1)/var ]')
+if ! grep -qF "$GUARD_EXPECT" "$ROOTCOPY_FILE"; then
+  echo "::error::/var 补丁格式不合法（TAB 被换成了空格），make 会报 missing separator。实际内容（^I = TAB）："
+  grep -n -A2 'ROOT_VAR_FIX' "$ROOTCOPY_FILE" | cat -A
+  exit 1
+fi
+echo "---- 补丁内容（^I = TAB）----"
+grep -n -A1 'ROOT_VAR_FIX' "$ROOTCOPY_FILE" | cat -A
